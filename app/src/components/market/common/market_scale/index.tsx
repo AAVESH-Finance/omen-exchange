@@ -4,7 +4,8 @@ import React, { useEffect, useRef, useState } from 'react'
 import ReactTooltip from 'react-tooltip'
 import styled from 'styled-components'
 
-import { formatBigNumber, formatNumber, isDust } from '../../../../util/tools'
+import { useConnectedWeb3Context } from '../../../../hooks'
+import { formatBigNumber, formatNumber, getInitialCollateral, isDust } from '../../../../util/tools'
 import {
   BalanceItem,
   LiquidityObject,
@@ -337,7 +338,7 @@ export const MarketScale: React.FC<Props> = (props: Props) => {
     unit,
     upperBound,
   } = props
-
+  const context = useConnectedWeb3Context()
   const lowerBoundNumber = lowerBound && Number(formatBigNumber(lowerBound, 18))
   const upperBoundNumber = upperBound && Number(formatBigNumber(upperBound, 18))
   const startingPointNumber = startingPoint && Number(formatBigNumber(startingPoint || new BigNumber(0), 18))
@@ -347,7 +348,10 @@ export const MarketScale: React.FC<Props> = (props: Props) => {
 
   const amountSharesNumber =
     collateral && Number(formatBigNumber(amountShares || new BigNumber(0), collateral.decimals))
-
+  let baseCollateral = collateral
+  if (collateral) {
+    baseCollateral = getInitialCollateral(context.networkId, collateral)
+  }
   const amountNumber = collateral && Number(formatBigNumber(amount || new BigNumber(0), collateral.decimals))
   const feeNumber = fee && collateral && Number(formatBigNumber(fee, collateral.decimals))
 
@@ -715,7 +719,7 @@ export const MarketScale: React.FC<Props> = (props: Props) => {
       {!isPositionTableDisabled && balances && collateral && trades && (
         <PositionTable
           balances={balances}
-          collateral={collateral}
+          collateral={baseCollateral ? baseCollateral : collateral}
           fee={fee}
           longPayout={longPayout}
           longProfitLoss={longProfitAmount}

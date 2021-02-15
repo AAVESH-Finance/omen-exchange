@@ -14,12 +14,20 @@ import {
   useCpkAllowance,
   useCpkProxy,
 } from '../../../../hooks'
-import { MarketMakerService } from '../../../../services'
+import { CompoundService, MarketMakerService } from '../../../../services'
 import { getLogger } from '../../../../util/logger'
 import { getNativeAsset, getWrapToken, pseudoNativeAssetAddress } from '../../../../util/networks'
 import { RemoteData } from '../../../../util/remote_data'
-import { computeBalanceAfterTrade, formatBigNumber, formatNumber, getUnit, mulBN } from '../../../../util/tools'
-import { MarketDetailsTab, MarketMakerData, Status, Ternary, Token } from '../../../../util/types'
+import {
+  computeBalanceAfterTrade,
+  formatBigNumber,
+  formatNumber,
+  getInitialCollateral,
+  getSharesInBaseToken,
+  getUnit,
+  mulBN,
+} from '../../../../util/tools'
+import { CompoundTokenType, MarketDetailsTab, MarketMakerData, Status, Ternary, Token } from '../../../../util/types'
 import { Button, ButtonContainer, ButtonTab } from '../../../button'
 import { ButtonType } from '../../../button/button_styling_types'
 import { BigNumberInput, TextfieldCustomPlaceholder } from '../../../common'
@@ -48,6 +56,7 @@ const StyledButtonContainer = styled(ButtonContainer)`
 const logger = getLogger('Scalar Market::Buy')
 
 interface Props {
+  compoundService: CompoundService | null
   fetchGraphMarketMakerData: () => Promise<void>
   fetchGraphMarketUserTxData: () => Promise<void>
   marketMakerData: MarketMakerData
@@ -55,7 +64,13 @@ interface Props {
 }
 
 export const ScalarMarketBuy = (props: Props) => {
-  const { fetchGraphMarketMakerData, fetchGraphMarketUserTxData, marketMakerData, switchMarketTab } = props
+  const {
+    compoundService,
+    fetchGraphMarketMakerData,
+    fetchGraphMarketUserTxData,
+    marketMakerData,
+    switchMarketTab,
+  } = props
   const context = useConnectedWeb3Context()
   const cpk = useConnectedCPKContext()
 
@@ -90,6 +105,19 @@ export const ScalarMarketBuy = (props: Props) => {
       : marketMakerData.collateral
   const [collateral, setCollateral] = useState<Token>(initialCollateral)
 
+  const collateralSymbol = collateral.symbol.toLowerCase()
+
+  const baseCollateral = getInitialCollateral(networkId, collateral)
+  const [displayCollateral, setDisplayCollateral] = useState<Token>(baseCollateral)
+  let displayBalances = balances
+  if (
+    baseCollateral.address !== collateral.address &&
+    collateral.symbol.toLowerCase() in CompoundTokenType &&
+    compoundService
+  ) {
+    displayBalances = getSharesInBaseToken(balances, compoundService, baseCollateral)
+  }
+
   const [activeTab, setActiveTab] = useState(Tabs.short)
   const [positionIndex, setPositionIndex] = useState(0)
   const [status, setStatus] = useState<Status>(Status.Ready)
@@ -97,15 +125,16 @@ export const ScalarMarketBuy = (props: Props) => {
   const [message, setMessage] = useState<string>('')
   const [tweet, setTweet] = useState('')
   const [isModalTransactionResultOpen, setIsModalTransactionResultOpen] = useState(false)
+  const [displayFundAmount, setDisplayFundAmount] = useState<Maybe<BigNumber>>(new BigNumber(0))
 
   const [allowanceFinished, setAllowanceFinished] = useState(false)
-  const { allowance, unlock } = useCpkAllowance(signer, collateral.address)
+  const { allowance, unlock } = useCpkAllowance(signer, displayCollateral.address)
 
   const hasEnoughAllowance = RemoteData.mapToTernary(allowance, allowance => allowance.gte(amount))
   const hasZeroAllowance = RemoteData.mapToTernary(allowance, allowance => allowance.isZero())
 
   const { collateralBalance: maybeCollateralBalance, fetchCollateralBalance } = useCollateralBalance(
-    collateral,
+    displayCollateral,
     context,
   )
   const collateralBalance = maybeCollateralBalance || Zero
@@ -136,8 +165,8 @@ export const ScalarMarketBuy = (props: Props) => {
   const isUpdated = RemoteData.hasData(proxyIsUpToDate) ? proxyIsUpToDate.data : true
 
   const showUpgrade =
-    (!isUpdated && collateral.address === pseudoNativeAssetAddress) ||
-    (upgradeFinished && collateral.address === pseudoNativeAssetAddress)
+    (!isUpdated && displayCollateral.address === pseudoNativeAssetAddress) ||
+    (upgradeFinished && displayCollateral.address === pseudoNativeAssetAddress)
 
   const upgradeProxy = async () => {
     if (!cpk) {
@@ -202,7 +231,7 @@ export const ScalarMarketBuy = (props: Props) => {
     !cpk?.cpk.isSafeApp() &&
     (allowanceFinished || hasZeroAllowance === Ternary.True || hasEnoughAllowance === Ternary.False)
 
-  const shouldDisplayMaxButton = collateral.address !== pseudoNativeAssetAddress
+  const shouldDisplayMaxButton = displayCollateral.address !== pseudoNativeAssetAddress
 
   const amountError =
     maybeCollateralBalance === null
@@ -227,14 +256,25 @@ export const ScalarMarketBuy = (props: Props) => {
         return
       }
 
-      const sharesAmount = formatBigNumber(tradedShares, collateral.decimals)
+      let displayTradedShares = tradedShares
+      let displayCollateralToken = collateral
+      let useBaseToken = false
+      let inputAmount = amount || Zero
+      if (collateralSymbol in CompoundTokenType && compoundService && amount) {
+        displayTradedShares = compoundService.calculateCTokenToBaseExchange(baseCollateral, tradedShares)
+        displayCollateralToken = baseCollateral
+        useBaseToken = true
+        inputAmount = compoundService.calculateCTokenToBaseExchange(baseCollateral, amount)
+      }
+      const sharesAmount = formatBigNumber(displayTradedShares, displayCollateralToken.decimals)
 
       setStatus(Status.Loading)
       setMessage(`Buying ${sharesAmount} shares ...`)
 
       await cpk.buyOutcomes({
-        amount,
+        amount: inputAmount,
         collateral,
+        compoundService,
         outcomeIndex,
         marketMaker,
       })
@@ -250,7 +290,6 @@ export const ScalarMarketBuy = (props: Props) => {
 
       What do you think?`),
       )
-
       setAmount(new BigNumber(0))
       setStatus(Status.Ready)
       setMessage(`Successfully bought ${sharesAmount} '${balances[outcomeIndex].outcomeName}' shares.`)
@@ -262,11 +301,18 @@ export const ScalarMarketBuy = (props: Props) => {
     setIsModalTransactionResultOpen(true)
   }
 
-  const currencyFilters =
+  let currencyFilters =
     collateral.address === wrapToken.address || collateral.address === pseudoNativeAssetAddress
       ? [wrapToken.address.toLowerCase(), pseudoNativeAssetAddress.toLowerCase()]
       : []
 
+  if (collateralSymbol in CompoundTokenType) {
+    if (baseCollateral.symbol.toLowerCase() === 'eth') {
+      currencyFilters = [collateral.address, pseudoNativeAssetAddress.toLowerCase()]
+    } else {
+      currencyFilters = [collateral.address, baseCollateral.address]
+    }
+  }
   return (
     <>
       <MarketScale
